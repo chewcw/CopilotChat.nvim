@@ -13,7 +13,8 @@ local M = {}
 --- Pick an action from a list of actions
 ---@param pick_actions CopilotChat.integrations.actions?: A table with the actions to pick from
 ---@param opts table?: Telescope options
-function M.pick(pick_actions, opts)
+---@param action_callback function?: A callback to run after the action is picked
+function M.pick(pick_actions, opts, action_callback)
   if not pick_actions or not pick_actions.actions or vim.tbl_isempty(pick_actions.actions) then
     return
   end
@@ -52,7 +53,11 @@ function M.pick(pick_actions, opts)
           end
 
           vim.defer_fn(function()
-            chat.ask(pick_actions.actions[selected[1]].prompt, pick_actions.actions[selected[1]])
+            if not action_callback then
+              chat.ask(pick_actions.actions[selected[1]].prompt, pick_actions.actions[selected[1]])
+              return
+            end
+            action_callback(selected)
           end, 100)
         end)
         return true

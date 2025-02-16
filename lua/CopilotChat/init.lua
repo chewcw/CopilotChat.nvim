@@ -231,7 +231,7 @@ local function resolve_prompts(prompt, config)
     end
     depth = depth + 1
 
-    inner_prompt = string.gsub(inner_prompt, '/' .. WORD, function(match)
+    inner_prompt = string.gsub(inner_prompt, '!' .. WORD, function(match)
       local p = prompts_to_use[match]
       if p then
         local resolved_prompt, resolved_config = resolve(p.prompt or '', p)
@@ -239,7 +239,7 @@ local function resolve_prompts(prompt, config)
         return resolved_prompt
       end
 
-      return '/' .. match
+      return '!' .. match
     end)
 
     depth = depth - 1
@@ -521,8 +521,8 @@ end
 ---@return table
 function M.complete_info()
   return {
-    triggers = { '@', '/', '#', '$' },
-    pattern = [[\%(@\|/\|#\|\$\)\S*]],
+    triggers = { '@', '!', '#', '$' },
+    pattern = [[\%(@\|!\|#\|\$\)\S*]],
   }
 end
 
@@ -547,7 +547,7 @@ function M.complete_items(callback)
       end
 
       items[#items + 1] = {
-        word = '/' .. name,
+        word = '!' .. name,
         abbr = name,
         kind = kind,
         info = info,
@@ -965,11 +965,11 @@ function M.setup(config)
   -- Handle removed commands
   vim.api.nvim_create_user_command('CopilotChatFixDiagnostic', function()
     utils.deprecate('CopilotChatFixDiagnostic', 'CopilotChatFix')
-    M.ask('/Fix')
+    M.ask('!Fix')
   end, { force = true })
   vim.api.nvim_create_user_command('CopilotChatCommitStaged', function()
     utils.deprecate('CopilotChatCommitStaged', 'CopilotChatCommit')
-    M.ask('/Commit')
+    M.ask('!Commit')
   end, { force = true })
 
   M.config = vim.tbl_deep_extend('force', default_config, config or {})
@@ -1050,7 +1050,7 @@ function M.setup(config)
         chat_help = chat_help .. '`@<agent>` to select an agent\n'
         chat_help = chat_help .. '`#<context>` to select a context\n'
         chat_help = chat_help .. '`#<context>:<input>` to select input for context\n'
-        chat_help = chat_help .. '`/<prompt>` to select a prompt\n'
+        chat_help = chat_help .. '`!<prompt>` to select a prompt\n'
         chat_help = chat_help .. '`$<model>` to select a model\n'
         chat_help = chat_help .. '`> <text>` to make a sticky prompt (copied to next prompt)\n'
 

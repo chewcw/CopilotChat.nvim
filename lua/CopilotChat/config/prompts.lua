@@ -93,10 +93,10 @@ return {
     system_prompt = COPILOT_GENERATE,
   },
   Explain = {
-    prompt = '> /COPILOT_EXPLAIN\n\nWrite an explanation for the selected code as paragraphs of text.',
+    prompt = '> !COPILOT_EXPLAIN\n\nWrite an explanation for the selected code as paragraphs of text.',
   },
   Review = {
-    prompt = '> /COPILOT_REVIEW\n\nReview the selected code.',
+    prompt = '> !COPILOT_REVIEW\n\nReview the selected code.',
     callback = function(response, source)
       local diagnostics = {}
       for line in response:gmatch('[^\r\n]+') do
@@ -138,16 +138,16 @@ return {
     end,
   },
   Fix = {
-    prompt = '> /COPILOT_GENERATE\n\nThere is a problem in this code. Rewrite the code to show it with the bug fixed.',
+    prompt = '> !COPILOT_GENERATE\n\nThere is a problem in this code. Rewrite the code to show it with the bug fixed.',
   },
   Optimize = {
-    prompt = '> /COPILOT_GENERATE\n\nOptimize the selected code to improve performance and readability.',
+    prompt = '> !COPILOT_GENERATE\n\nOptimize the selected code to improve performance and readability.',
   },
   Docs = {
-    prompt = '> /COPILOT_GENERATE\n\nPlease add documentation comments to the selected code.',
+    prompt = '> !COPILOT_GENERATE\n\nPlease add documentation comments to the selected code.',
   },
   Tests = {
-    prompt = '> /COPILOT_GENERATE\n\nPlease generate tests for my code.',
+    prompt = '> !COPILOT_GENERATE\n\nPlease generate tests for my code.',
   },
   Commit = {
     prompt = '> #git:staged\n\nWrite commit message for the change with commitizen convention. Make sure the title has maximum 50 characters and message is wrapped at 72 characters. Wrap the whole message in code block with language gitcommit.',

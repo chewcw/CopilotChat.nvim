@@ -214,7 +214,6 @@ local Client = class(function(self, providers)
   self.current_job = nil
   self.expires_at = nil
   self.headers = nil
-  self.machineid = utils.machine_id()
 end)
 
 --- Authenticate with GitHub and get the required headers
@@ -226,11 +225,13 @@ function Client:authenticate(provider_name)
   local expires_at = self.provider_cache[provider_name].expires_at
 
   if not headers or (expires_at and expires_at <= math.floor(os.time())) then
-    notify.publish(notify.STATUS, 'Authenticating to provider ' .. provider_name)
+    local token
+    if provider.get_token then
+      notify.publish(notify.STATUS, 'Authenticating to provider ' .. provider_name)
+      token, expires_at = provider.get_token()
+    end
 
-    local token, expires_at = provider.get_token()
-    local sessionid = utils.uuid() .. tostring(math.floor(os.time() * 1000))
-    headers = provider.get_headers(token, sessionid, self.machineid)
+    headers = provider.get_headers(token)
     self.provider_cache[provider_name].headers = headers
     self.provider_cache[provider_name].expires_at = expires_at
   end
@@ -246,20 +247,30 @@ function Client:fetch_models()
   end
 
   local models = {}
-  for provider_name, provider in pairs(self.providers) do
+  local provider_order = vim.tbl_keys(self.providers)
+  table.sort(provider_order)
+  for _, provider_name in ipairs(provider_order) do
+    local provider = self.providers[provider_name]
     if not provider.disabled and provider.get_models then
       local headers = self:authenticate(provider_name)
       notify.publish(notify.STATUS, 'Fetching models from ' .. provider_name)
-      local provider_models = provider.get_models(headers)
-      for _, model in ipairs(provider_models) do
-        model.provider = provider_name
-        if not models[model.id] then
+      local ok, provider_models = pcall(provider.get_models, headers)
+      if ok then
+        for _, model in ipairs(provider_models) do
+          model.provider = provider_name
+          if models[model.id] then
+            model.id = model.id .. ':' .. provider_name
+            model.version = model.version .. ':' .. provider_name
+          end
           models[model.id] = model
         end
+      else
+        log.warn('Failed to fetch models from ' .. provider_name .. ': ' .. provider_models)
       end
     end
   end
 
+  log.debug('Fetched models: ', vim.inspect(models))
   self.models = models
   return self.models
 end
@@ -272,16 +283,24 @@ function Client:fetch_agents()
   end
 
   local agents = {}
-  for provider_name, provider in pairs(self.providers) do
+  local provider_order = vim.tbl_keys(self.providers)
+  table.sort(provider_order)
+  for _, provider_name in ipairs(provider_order) do
+    local provider = self.providers[provider_name]
     if not provider.disabled and provider.get_agents then
       local headers = self:authenticate(provider_name)
       notify.publish(notify.STATUS, 'Fetching agents from ' .. provider_name)
-      local provider_agents = provider.get_agents(headers)
-      for _, agent in ipairs(provider_agents) do
-        agent.provider = provider_name
-        if not agents[agent.id] then
+      local ok, provider_agents = pcall(provider.get_agents, headers)
+      if ok then
+        for _, agent in ipairs(provider_agents) do
+          agent.provider = provider_name
+          if agents[agent.id] then
+            agent.id = agent.id .. ':' .. provider_name
+          end
           agents[agent.id] = agent
         end
+      else
+        log.warn('Failed to fetch agents from ' .. provider_name .. ': ' .. provider_agents)
       end
     end
   end
@@ -405,10 +424,11 @@ function Client:ask(prompt, opts)
   end
 
   local function parse_line(line, job)
-    if not line then
+    if not line or line == '' then
       return
     end
 
+    log.debug('Response line: ', line)
     notify.publish(notify.STATUS, '')
 
     local ok, content = pcall(vim.json.decode, line, {
@@ -444,12 +464,14 @@ function Client:ask(prompt, opts)
       end
     end
 
-    if not content.choices or #content.choices == 0 then
-      return
+    local choice
+    if content.choices and #content.choices > 0 then
+      choice = content.choices[1]
+    else
+      choice = content
     end
 
     last_message = content
-    local choice = content.choices[1]
     content = choice.message and choice.message.content or choice.delta and choice.delta.content
 
     if content then
@@ -460,22 +482,22 @@ function Client:ask(prompt, opts)
       on_progress(content)
     end
 
-    if choice.finish_reason and job then
-      local reason = choice.finish_reason
-      if reason == 'stop' then
-        reason = nil
-      else
-        reason = 'Early stop: ' .. reason
+    if job then
+      local reason = choice.finish_reason or choice.done_reason
+
+      if reason then
+        if reason == 'stop' then
+          reason = nil
+        else
+          reason = 'Early stop: ' .. reason
+        end
+        finish_stream(reason, job)
       end
-      finish_stream(reason, job)
     end
   end
 
   local function parse_stream_line(line, job)
     line = vim.trim(line)
-    if not vim.startswith(line, 'data:') then
-      return
-    end
     line = line:gsub('^data:', '')
     line = vim.trim(line)
 
@@ -507,6 +529,8 @@ function Client:ask(prompt, opts)
     parse_stream_line(line, job)
   end
 
+  opts.agent = opts.agent and opts.agent:gsub(':' .. provider_name .. '$', '')
+  opts.model = opts.model:gsub(':' .. provider_name .. '$', '')
   local headers = self:authenticate(provider_name)
   local request = provider.prepare_input(
     generate_ask_request(history, prompt, system_prompt, generated_messages),
@@ -750,6 +774,7 @@ function Client:embed(inputs, model)
       })
 
       if err or not response or response.status ~= 200 then
+        log.debug('Failed to get embeddings: ', err)
         attempts = attempts + 1
         -- If we have few items and the request failed, try reducing threshold first
         if #batch <= 5 then

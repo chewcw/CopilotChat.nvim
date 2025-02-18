@@ -1,13 +1,14 @@
 ---@class CopilotChat.Client.ask
+---@field history table
 ---@field selection CopilotChat.select.selection?
 ---@field embeddings table<CopilotChat.context.embed>?
 ---@field system_prompt string
 ---@field model string
 ---@field agent string
 ---@field temperature number?
----@field no_history boolean?
 ---@field on_progress nil|fun(response: string):nil
 
+local async = require('plenary.async')
 local log = require('plenary.log')
 local tiktoken = require('CopilotChat.tiktoken')
 local notify = require('CopilotChat.notify')
@@ -189,7 +190,6 @@ end
 
 ---@class CopilotChat.Client : Class
 ---@field providers table<string, CopilotChat.Provider>
----@field history table
 ---@field provider_cache table<string, table>
 ---@field embedding_cache table<CopilotChat.context.embed>
 ---@field models table<string, table>?
@@ -199,18 +199,12 @@ end
 ---@field token table?
 ---@field sessionid string?
 ---@field machineid string
-local Client = class(function(self, providers)
-  self.providers = providers
-  self.history = {}
+local Client = class(function(self)
+  self.providers = {}
   self.embedding_cache = {}
   self.models = nil
   self.agents = nil
-
   self.provider_cache = {}
-  for provider_name, _ in pairs(providers) do
-    self.provider_cache[provider_name] = {}
-  end
-
   self.current_job = nil
   self.expires_at = nil
   self.headers = nil
@@ -227,7 +221,6 @@ function Client:authenticate(provider_name)
   if not headers or (expires_at and expires_at <= math.floor(os.time())) then
     local token
     if provider.get_token then
-      notify.publish(notify.STATUS, 'Authenticating to provider ' .. provider_name)
       token, expires_at = provider.get_token()
     end
 
@@ -252,8 +245,8 @@ function Client:fetch_models()
   for _, provider_name in ipairs(provider_order) do
     local provider = self.providers[provider_name]
     if not provider.disabled and provider.get_models then
-      local headers = self:authenticate(provider_name)
       notify.publish(notify.STATUS, 'Fetching models from ' .. provider_name)
+      local headers = self:authenticate(provider_name)
       local ok, provider_models = pcall(provider.get_models, headers)
       if ok then
         for _, model in ipairs(provider_models) do
@@ -288,8 +281,8 @@ function Client:fetch_agents()
   for _, provider_name in ipairs(provider_order) do
     local provider = self.providers[provider_name]
     if not provider.disabled and provider.get_agents then
-      local headers = self:authenticate(provider_name)
       notify.publish(notify.STATUS, 'Fetching agents from ' .. provider_name)
+      local headers = self:authenticate(provider_name)
       local ok, provider_agents = pcall(provider.get_agents, headers)
       if ok then
         for _, agent in ipairs(provider_agents) do
@@ -312,6 +305,7 @@ end
 --- Ask a question to Copilot
 ---@param prompt string: The prompt to send to Copilot
 ---@param opts CopilotChat.Client.ask: Options for the request
+---@return string, table, number, number
 function Client:ask(prompt, opts)
   opts = opts or {}
   prompt = vim.trim(prompt)
@@ -320,18 +314,19 @@ function Client:ask(prompt, opts)
     opts.agent = nil
   end
 
+  local history = opts.history or {}
   local embeddings = opts.embeddings or {}
   local selection = opts.selection or {}
   local system_prompt = vim.trim(opts.system_prompt)
   local model = opts.model
   local agent = opts.agent
   local temperature = opts.temperature or 0.1
-  local no_history = opts.no_history or false
   local on_progress = opts.on_progress
   local job_id = utils.uuid()
   self.current_job = job_id
 
   log.trace('System prompt: ', system_prompt)
+  log.trace('History: ', #history)
   log.trace('Selection: ', selection.content)
   log.debug('Prompt: ', prompt)
   log.debug('Embeddings: ', #embeddings)
@@ -339,7 +334,6 @@ function Client:ask(prompt, opts)
   log.debug('Agent: ', agent)
   log.debug('Temperature: ', temperature)
 
-  local history = no_history and {} or self.history
   local models = self:fetch_models()
   local model_config = models[model]
   if not model_config then
@@ -360,6 +354,17 @@ function Client:ask(prompt, opts)
   log.debug('Max tokens: ', max_tokens)
   log.debug('Tokenizer: ', tokenizer)
   tiktoken.load(tokenizer)
+
+  notify.publish(notify.STATUS, 'Generating request')
+
+  async.util.scheduler()
+  local references = {}
+  for _, embed in ipairs(embeddings) do
+    table.insert(references, {
+      name = utils.filename(embed.filename),
+      url = embed.filename,
+    })
+  end
 
   local generated_messages = {}
   local selection_messages = generate_selection_messages(selection)
@@ -410,7 +415,6 @@ function Client:ask(prompt, opts)
   local errored = false
   local finished = false
   local full_response = ''
-  local full_references = ''
 
   local function finish_stream(err, job)
     if err then
@@ -452,14 +456,10 @@ function Client:ask(prompt, opts)
       for _, reference in ipairs(content.copilot_references) do
         local metadata = reference.metadata
         if metadata and metadata.display_name and metadata.display_url then
-          full_references = full_references
-            .. '\n'
-            .. '['
-            .. metadata.display_name
-            .. ']'
-            .. '('
-            .. metadata.display_url
-            .. ')'
+          table.insert(references, {
+            name = metadata.display_name,
+            url = metadata.display_url,
+          })
         end
       end
     end
@@ -529,6 +529,8 @@ function Client:ask(prompt, opts)
     parse_stream_line(line, job)
   end
 
+  notify.publish(notify.STATUS, 'Thinking')
+
   opts.agent = opts.agent and opts.agent:gsub(':' .. provider_name .. '$', '')
   opts.model = opts.model:gsub(':' .. provider_name .. '$', '')
   local headers = self:authenticate(provider_name)
@@ -549,12 +551,10 @@ function Client:ask(prompt, opts)
     args.stream = stream_func
   end
 
-  notify.publish(notify.STATUS, 'Thinking')
-
   local response, err = utils.curl_post(provider.get_url(opts), args)
 
   if self.current_job ~= job_id then
-    return nil, nil, nil
+    return
   end
 
   self.current_job = nil
@@ -617,34 +617,12 @@ function Client:ask(prompt, opts)
     return
   end
 
-  if full_references ~= '' then
-    full_references = '\n\n**`References:`**' .. full_references
-    full_response = full_response .. full_references
-    if on_progress then
-      on_progress(full_references)
-    end
-  end
-
   log.trace('Full response: ', full_response)
   log.debug('Last message: ', last_message)
 
-  table.insert(history, {
-    content = prompt,
-    role = 'user',
-  })
-
-  table.insert(history, {
-    content = full_response,
-    role = 'assistant',
-  })
-
-  if not no_history then
-    log.debug('History size increased to ' .. #history)
-    self.history = history
-  end
-
   return full_response,
-    last_message and last_message.usage and last_message.usage.total_tokens,
+    references,
+    last_message and last_message.usage and last_message.usage.total_tokens or 0,
     max_tokens
 end
 
@@ -710,6 +688,7 @@ function Client:embed(inputs, model)
     error('Model not found: ' .. model)
   end
 
+  -- Resolve model provider
   local provider_name = model_config.provider
   if not provider_name then
     error('Provider not found for model: ' .. model)
@@ -718,9 +697,11 @@ function Client:embed(inputs, model)
   if not provider then
     error('Provider not found: ' .. model_config.provider)
   end
+
+  -- Resolve embedding provider, and if resolution fails, do not resolve embeddings
   provider_name = provider.embeddings
   if not provider_name then
-    error('Provider not found for embeddings: ' .. provider_name)
+    return inputs
   end
   provider = self.providers[provider_name]
   if not provider then
@@ -841,53 +822,19 @@ function Client:reset()
   return stopped
 end
 
---- Save the history to a file
----@param name string: The name to save the history to
----@param path string: The path to save the history to
-function Client:save(name, path)
-  local history = vim.json.encode(self.history)
-  path = vim.fn.expand(path)
-  vim.fn.mkdir(path, 'p')
-  path = path .. '/' .. name .. '.json'
-  local file = io.open(path, 'w')
-  if not file then
-    log.error('Failed to save history to ' .. path)
-    return
-  end
-
-  file:write(history)
-  file:close()
-  log.info('Saved Copilot history to ' .. path)
-end
-
---- Load the history from a file
----@param name string: The name to load the history from
----@param path string: The path to load the history from
----@return table
-function Client:load(name, path)
-  path = vim.fn.expand(path) .. '/' .. name .. '.json'
-  local file = io.open(path, 'r')
-  if not file then
-    return {}
-  end
-
-  local history = file:read('*a')
-  file:close()
-  self.history = vim.json.decode(history, {
-    luanil = {
-      object = true,
-      array = true,
-    },
-  })
-
-  log.info('Loaded Copilot history from ' .. path)
-  return self.history
-end
-
 --- Check if there is a running job
 ---@return boolean
 function Client:running()
   return self.current_job ~= nil
 end
 
-return Client
+--- Load providers to client
+function Client:load_providers(providers)
+  self.providers = providers
+  for provider_name, _ in pairs(providers) do
+    self.provider_cache[provider_name] = {}
+  end
+end
+
+--- @type CopilotChat.Client
+return Client()

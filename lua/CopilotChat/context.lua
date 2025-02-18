@@ -14,9 +14,11 @@
 ---@field outline string?
 ---@field symbols table<string, CopilotChat.context.symbol>?
 ---@field embedding table<number>?
+---@field score number?
 
 local async = require('plenary.async')
 local log = require('plenary.log')
+local client = require('CopilotChat.client')
 local notify = require('CopilotChat.notify')
 local utils = require('CopilotChat.utils')
 local file_cache = {}
@@ -64,15 +66,21 @@ local OFF_SIDE_RULE_LANGUAGES = {
   'fsharp',
 }
 
-local TOP_SYMBOLS = 100
-local TOP_RELATED = 25
+local MIN_SYMBOL_SIMILARITY = 0.3
+local MIN_SEMANTIC_SIMILARITY = 0.4
 local MULTI_FILE_THRESHOLD = 5
+local MAX_FILES = 2500
 
 --- Compute the cosine similarity between two vectors
 ---@param a table<number>
 ---@param b table<number>
+---@param def number
 ---@return number
-local function spatial_distance_cosine(a, b)
+local function spatial_distance_cosine(a, b, def)
+  if not a or not b then
+    return def or 0
+  end
+
   local dot_product = 0
   local magnitude_a = 0
   local magnitude_b = 0
@@ -89,78 +97,124 @@ end
 --- Rank data by relatedness to the query
 ---@param query CopilotChat.context.embed
 ---@param data table<CopilotChat.context.embed>
----@param top_n number
+---@param min_similarity number
 ---@return table<CopilotChat.context.embed>
-local function data_ranked_by_relatedness(query, data, top_n)
-  data = vim.tbl_map(function(item)
-    return vim.tbl_extend(
-      'force',
-      item,
-      { score = spatial_distance_cosine(item.embedding, query.embedding) }
-    )
-  end, data)
-
-  table.sort(data, function(a, b)
-    return a.score > b.score
-  end)
-
-  return vim.list_slice(data, 1, top_n)
-end
-
---- Rank data by symbols
----@param query string
----@param data table<CopilotChat.context.embed>
----@param top_n number
-local function data_ranked_by_symbols(query, data, top_n)
-  local query_terms = {}
-  for term in query:lower():gmatch('%w+') do
-    query_terms[term] = true
-  end
-
+local function data_ranked_by_relatedness(query, data, min_similarity)
   local results = {}
-  for _, entry in ipairs(data) do
-    local score = 0
-    local filename = entry.filename and entry.filename:lower() or ''
-
-    -- Filename matches (highest priority)
-    for term in pairs(query_terms) do
-      if filename:find(term, 1, true) then
-        score = score + 15
-        if vim.fn.fnamemodify(filename, ':t'):gsub('%..*$', '') == term then
-          score = score + 10
-        end
-      end
+  for _, item in ipairs(data) do
+    local similarity = spatial_distance_cosine(item.embedding, query.embedding, item.score)
+    if similarity >= min_similarity then
+      table.insert(results, vim.tbl_extend('force', item, { score = similarity }))
     end
-
-    -- Symbol matches
-    if entry.symbols then
-      for _, symbol in ipairs(entry.symbols) do
-        for term in pairs(query_terms) do
-          -- Check symbol name (high priority)
-          if symbol.name and symbol.name:lower():find(term, 1, true) then
-            score = score + 5
-            if symbol.name:lower() == term then
-              score = score + 3
-            end
-          end
-
-          -- Check signature (medium priority)
-          -- This catches parameter names, return types, etc
-          if symbol.signature and symbol.signature:lower():find(term, 1, true) then
-            score = score + 2
-          end
-        end
-      end
-    end
-
-    table.insert(results, vim.tbl_extend('force', entry, { score = score }))
   end
 
   table.sort(results, function(a, b)
     return a.score > b.score
   end)
 
-  return vim.list_slice(results, 1, top_n)
+  return results
+end
+
+-- Create trigrams from text (e.g., "hello" -> {"hel", "ell", "llo"})
+local function get_trigrams(text)
+  local trigrams = {}
+  text = text:lower()
+  for i = 1, #text - 2 do
+    trigrams[text:sub(i, i + 2)] = true
+  end
+  return trigrams
+end
+
+-- Calculate Jaccard similarity between two trigram sets
+local function trigram_similarity(set1, set2)
+  local intersection = 0
+  local union = 0
+
+  -- Count intersection and union
+  for trigram in pairs(set1) do
+    if set2[trigram] then
+      intersection = intersection + 1
+    end
+    union = union + 1
+  end
+
+  for trigram in pairs(set2) do
+    if not set1[trigram] then
+      union = union + 1
+    end
+  end
+
+  return intersection / union
+end
+
+local function data_ranked_by_symbols(query, data, min_similarity)
+  -- Get query trigrams including compound versions
+  local query_trigrams = {}
+
+  -- Add trigrams for each word
+  for term in query:lower():gmatch('%w+') do
+    for trigram in pairs(get_trigrams(term)) do
+      query_trigrams[trigram] = true
+    end
+  end
+
+  -- Add trigrams for compound query
+  local compound_query = query:lower():gsub('[^%w]', '')
+  for trigram in pairs(get_trigrams(compound_query)) do
+    query_trigrams[trigram] = true
+  end
+
+  local results = {}
+  local max_score = 0
+
+  for _, entry in ipairs(data) do
+    local score = 0
+    local basename = vim.fn.fnamemodify(entry.filename, ':t'):gsub('%..*$', '')
+
+    -- Get trigrams for basename and compound version
+    local file_trigrams = get_trigrams(basename)
+    local compound_trigrams = get_trigrams(basename:gsub('[^%w]', ''))
+
+    -- Calculate similarities
+    local name_sim = trigram_similarity(query_trigrams, file_trigrams)
+    local compound_sim = trigram_similarity(query_trigrams, compound_trigrams)
+
+    -- Take best match
+    score = math.max(name_sim, compound_sim)
+
+    -- Add symbol matches
+    if entry.symbols then
+      local symbol_score = 0
+      for _, symbol in ipairs(entry.symbols) do
+        if symbol.name then
+          local symbol_trigrams = get_trigrams(symbol.name)
+          local sym_sim = trigram_similarity(query_trigrams, symbol_trigrams)
+          symbol_score = math.max(symbol_score, sym_sim)
+        end
+      end
+      score = score + (symbol_score * 0.5) -- Weight symbol matches less
+    end
+
+    if score > 0 then
+      max_score = math.max(max_score, score)
+      table.insert(results, vim.tbl_extend('force', entry, { score = score }))
+    end
+  end
+
+  -- Normalize and filter results
+  local filtered_results = {}
+  for _, result in ipairs(results) do
+    result.score = result.score / max_score
+    if result.score >= min_similarity then
+      table.insert(filtered_results, result)
+    end
+  end
+
+  table.sort(filtered_results, function(a, b)
+    return a.score > b.score
+  end)
+
+  return filtered_results
 end
 
 --- Get the full signature of a declaration
@@ -320,6 +374,7 @@ function M.files(winnr, with_content)
   local files = utils.scan_dir(cwd, {
     add_dirs = false,
     respect_gitignore = true,
+    max_files = MAX_FILES,
   })
 
   notify.publish(notify.STATUS, 'Reading files')
@@ -579,19 +634,20 @@ function M.quickfix()
 end
 
 --- Filter embeddings based on the query
----@param client CopilotChat.Client
 ---@param prompt string
 ---@param model string
 ---@param embeddings table<CopilotChat.context.embed>
 ---@return table<CopilotChat.context.embed>
-function M.filter_embeddings(client, prompt, model, embeddings)
+function M.filter_embeddings(prompt, model, embeddings)
   -- If we dont need to embed anything, just return directly
   if #embeddings < MULTI_FILE_THRESHOLD then
     return embeddings
   end
 
+  notify.publish(notify.STATUS, 'Ranking embeddings')
+
   -- Rank embeddings by symbols
-  embeddings = data_ranked_by_symbols(prompt, embeddings, TOP_SYMBOLS)
+  embeddings = data_ranked_by_symbols(prompt, embeddings, MIN_SYMBOL_SIMILARITY)
   log.debug('Ranked data:', #embeddings)
   for i, item in ipairs(embeddings) do
     log.debug(string.format('%s: %s - %s', i, item.score, item.filename))
@@ -610,7 +666,7 @@ function M.filter_embeddings(client, prompt, model, embeddings)
   -- Rate embeddings by relatedness to the query
   local embedded_query = table.remove(embeddings, #embeddings)
   log.debug('Embedded query:', embedded_query.content)
-  embeddings = data_ranked_by_relatedness(embedded_query, embeddings, TOP_RELATED)
+  embeddings = data_ranked_by_relatedness(embedded_query, embeddings, MIN_SEMANTIC_SIMILARITY)
   log.debug('Ranked embeddings:', #embeddings)
   for i, item in ipairs(embeddings) do
     log.debug(string.format('%s: %s - %s', i, item.score, item.filename))
